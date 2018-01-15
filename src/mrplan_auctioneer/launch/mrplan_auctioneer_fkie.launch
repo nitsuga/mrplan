@@ -1,0 +1,27 @@
+<launch>
+    <param name="/use_sim_time" value="true"/>
+
+    <arg name="reallocate" default="False"/>
+    <arg name="scenario_id" default=""/>
+
+    <node name="mrplan_auctioneer" pkg="mrplan_auctioneer" type="mrplan_auctioneer" required="true" output="screen">
+        <param name="scenario_file" value="$(find mrplan_auctioneer)/scenarios/$(arg scenario_id).yaml"/>
+        <param name="mechanism" value="$(arg mechanism)"/>
+        <param name="reallocate" value="$(arg reallocate)"/>
+    </node>
+
+    <!-- FKIE master discovery -->
+    <!--<node pkg="master_discovery_fkie" type="master_discovery" name="master_discovery" respawn="true" output="screen">-->
+        <!--<param name="name" value="auctioneer_master"/>-->
+        <!--&lt;!&ndash; We want a unique multicast group per experiment. Set it here to avoid conflicts on the cluster. &ndash;&gt;-->
+        <!--<param name="mcast_group" value="226.0.0.$(optenv SGE_TASK_ID 1)"/>-->
+    <!--</node>-->
+
+    <!-- FKIE master sync -->
+    <!--
+      <node pkg="master_sync_fkie" type="master_sync" name="master_sync" respawn="true" output="log">
+        <rosparam param="sync_hosts">[]</rosparam>
+      </node>
+    -->
+
+</launch>

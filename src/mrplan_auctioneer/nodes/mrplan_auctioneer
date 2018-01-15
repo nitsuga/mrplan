@@ -1,0 +1,14 @@
+#!/usr/bin/env python
+
+import rospy
+import sys
+import mrplan.auctioneer.Auctioneer
+
+
+if __name__ == '__main__':
+    try:
+        argv = rospy.myargv(argv=sys.argv[1:])
+        auc = Auctioneer(*argv)
+    except rospy.ROSInterruptException:
+        pass
+
