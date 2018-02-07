@@ -7,6 +7,7 @@ Eric Schneider <eric.schneider@liverpool.ac.uk>
 
 from enum import Enum
 
+
 class Material(Enum):
     """ Materials are composed to make up Items. At first, this class
     just identifies and distinguishes one material from another via an
@@ -23,7 +24,7 @@ class Material(Enum):
 
 class Item(object):
 
-    def __init__(self, _item_id='1', _materials=[0,0,0,0,0,0]):
+    def __init__(self, _item_id='1', _materials=[0, 0, 0, 0, 0, 0], _site=''):
 
         # A unique identifier for this item.
         self.item_id = _item_id
@@ -33,4 +34,10 @@ class Item(object):
         # (an enumeration, above) with an integer values that represents
         # the number of units of that material required.
         self.materials = _materials
+
+        self.site = _site
+
+        self.completed = False
+        self.awarded = False
+
 

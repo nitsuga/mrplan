@@ -81,20 +81,13 @@ import rospy
 import rospy.rostime
 import visualization_msgs.msg
 
-# MRTeAm-specific stuff
-import mrta
-import mrta.file_db
-import mrta.msg
-
-import mrta.mrta_planner_proxy
+# MRPlan-specific modules
+import mrplan_msgs.msg
+from mrplan_auctioneer.item import Item
 
 # p-median -finding libraries
 from p_median import pmed_greedy
 from p_median import teitz_bart
-
-
-# Name of the file-based database that stores tasks
-TASKS_DB_FILENAME = 'tasks.db'
 
 # We'll sleep 1/RATE seconds in every pass of the idle loop.
 RATE = 10
@@ -133,13 +126,13 @@ def powerset(iterable):
 
 
 class Auction(object):
-    def __init__(self, auctioneer=None, tasks=None, auction_round=None):
+    def __init__(self, auctioneer=None, items=None, auction_round=None):
         
         # A handle to the Auctioneer object who called us
         self.auctioneer = auctioneer
 
         # The tasks we are meant to announce/award in the current round
-        self.tasks = tasks
+        self.items = items
 
         # To identify in which round bids are made for tasks
         self.auction_round = auction_round
@@ -184,11 +177,25 @@ class Auction(object):
 
         return task_msg
 
+    def _construct_item_msg(self, item):
+        """
+        Maps from our internal item representation to a ROS message type.
+        (mrplan_auctioneer.item.Item => mrplan_msgs.msg.Item)
+        """
+        # Just sensor sweep tasks for now
+        item_msg = mrplan_msgs.msg.Item()
+
+        item_msg.item_id = item.item_id
+        item_msg.material_count = item.materials
+        item_msg.site = item.site
+
+        return item_msg
+
     def _construct_announcement_msg(self):
         pass
 
-    def _get_task_by_id(self, task_id):
-        return self.auctioneer.tasks_by_id[task_id]
+    def _get_item_by_id(self, item_id):
+        return self.auctioneer.item_by_id[item_id]
 
     def announce(self, e):
         pass
@@ -216,17 +223,18 @@ class AuctionOSI(Auction):
 
     mechanism_name = 'OSI'
 
-    def __init__(self, auctioneer=None, tasks=None, auction_round=None):
-        super(AuctionOSI, self).__init__(auctioneer, tasks, auction_round)
+    def __init__(self, auctioneer=None, items=None, auction_round=None):
+        super(AuctionOSI, self).__init__(auctioneer, items, auction_round)
 
     def _construct_announcement_msg(self):
-        announce_msg = mrta.msg.AnnounceSensorSweep()
-        announce_msg.mechanism = self.mechanism_name
-
-        # Only announce one task (the first in the auctioneer's list)
-        announce_msg.tasks.append(self._construct_task_msg(self.tasks[0]))
-
-        return announce_msg
+        # announce_msg = mrta.msg.AnnounceSensorSweep()
+        # announce_msg.mechanism = self.mechanism_name
+        #
+        # # Only announce one task (the first in the auctioneer's list)
+        # announce_msg.tasks.append(self._construct_task_msg(self.tasks[0]))
+        #
+        # return announce_msg
+        return self._construct_item_msg(self.items[0])
 
     def announce(self, e):
         rospy.loginfo("({0}) state: announce".format(self.mechanism_name))
@@ -239,6 +247,7 @@ class AuctionOSI(Auction):
         stamp(announcement_msg)
         self.auctioneer.announce_pub.publish(announcement_msg)
 
+        rospy.loginfo("announce_pub:\n{0}".format(pp.pformat(self.auctioneer.announce_pub)))
         rospy.loginfo("Announcement:\n{0}".format(pp.pformat(announcement_msg)))
 
         self.fsm.announced()
@@ -1160,28 +1169,15 @@ class Auctioneer:
         # self.mechanism = mechanism
         self.mechanism = rospy.get_param('~mechanism')
 
-        # Should we choose a mechanism as runtime (as opposed to using
-        # self.mechanism all the time)?
-        self.dynamic_mechanism = rospy.get_param('~dynamic_mechanism', False)
-
-        # # Tasks are loaded from a configuration file, rather than
-        # # created dynamically (for now)
-        # # self.task_file = task_file
-        # self.task_file = None
-        # try:
-        #     self.task_file = rospy.get_param('~task_file')
-        # except KeyError:
-        #     rospy.logerr("Parameter 'task_file' has no value!")
-
-        # Tasks are loaded from a file-based database (keyed by scenario id)
-        self.scenario_id = None
+        # Tasks are loaded from a configuration file
+        self.scenario_file = None
         try:
-            self.scenario_id = rospy.get_param('~scenario_id')
+            self.scenario_file = rospy.get_param('~scenario_file')
 
-            # (Legacy cleanup) remove .yaml extension if it is present
-            self.scenario_id = self.scenario_id.replace('.yaml', '')
+            # # (Legacy cleanup) remove .yaml extension if it is present
+            # self.scenario_id = self.scenario_id.replace('.yaml', '')
         except KeyError:
-            rospy.logerr("Parameter 'scenario_id' has no value!")
+            rospy.logerr("Parameter 'scenario_file' has no value!")
 
         # Do we reallocate tasks or not?
         try:
@@ -1197,20 +1193,20 @@ class Auctioneer:
         # self.planner_proxy = mrta.mrta_planner_proxy.PlannerProxy(dummy_robot_name)
 
         # Scripted tasks that are not necessarily 'live' at the start of the experiment
-        self.scripted_tasks = []
-        self.scripted_tasks_by_id = {}
+        self.scripted_items = []
+        self.scripted_items_by_id = {}
 
         # A simple list for now
-        self.tasks = []
+        self.items = []
 
         # We also want to be able to get tasks by id
-        self.tasks_by_id = {}
+        self.items_by_id = {}
 
         # Timers for tasks to 'appear'
-        self.task_timers = []
+        self.item_timers = []
 
         # If a new task has been 'generated'. Hacky, refactor.
-        self.new_task_added = False
+        self.new_item_added = False
 
         # To identify in which round bids are made for tasks
         self.auction_round = 0
@@ -1222,53 +1218,23 @@ class Auctioneer:
         # task_id => list of robot_name
         self.awarded = defaultdict(list)
 
-        self.ppsi_task_winners = None
-
-        # Classifier used to predict an appropriate mechanism in
-        # select_mechanism_dynamic(). This classifier will have been
-        # trained in scikit-learn and dumped to a file with pickle.
-        pkg = rospkg.RosPack()
-        pkg_path = pkg.get_path('mrta_auctioneer')
-
-        self.classifier = None
-        self.feature_names = None
-        try:
-            clf_base_filename = rospy.get_param('~classifier_name', 'clf_execution_phase_time_random_forest')
-            clf_classifier_filename = '{0}.dump'.format(clf_base_filename)
-            clf_features_filename = '{0}.features'.format(clf_base_filename)
-
-            classifier_path = os.path.join(pkg_path, 'classifier', clf_classifier_filename)
-            features_path = os.path.join(pkg_path, 'classifier', clf_features_filename)
-
-            with open(classifier_path, 'rb') as classifier_file:
-                self.classifier = pickle.load(classifier_file)
-
-            self.feature_names = []
-            with open(features_path, 'rb') as features_file:
-                for line in features_file:
-                    self.feature_names.append(line.rstrip())
-        except:
-            rospy.logerr("Error opening classifier/features".format(self.task_file))
-            e_type, e_value, e_traceback = sys.exc_info()
-            rospy.logerr("{0}: {1}".format(e_type, e_value))
-
         # Set up state machine.
         # See mrta/docs/auctioneer-fsm.png
         self.fsm = Fysom( 
             events=[
-                ('startup', 'none', 'load_tasks'),
-                ('tasks_loaded', 'load_tasks', 'identify_team'),
+                ('startup', 'none', 'load_scenario'),
+                ('scenario_loaded', 'load_scenario', 'identify_team'),
                 ('do_identify_team', '*', 'identify_team'),
                 ('team_identified', 'identify_team', 'idle'),
-                ('have_tasks', 'idle', 'choose_mechanism'),
+                ('have_items', 'idle', 'choose_mechanism'),
                 ('allocation_complete', 'choose_mechanism', 'monitor_execution'),
                 ('current_tasks_complete', 'monitor_execution', 'end_execution'),
                 ('have_tasks', 'end_execution', 'idle'),
-                ('all_scripted_tasks_complete', '*', 'end_experiment'),
+                ('all_scripted_items_complete', '*', 'end_experiment'),
             ],
             callbacks={
                 # on-enter state handlers
-                'onload_tasks': self.load_tasks,
+                'onload_scenario': self.load_scenario,
                 'onidentify_team': self.identify_team,
                 'onidle': self.idle,
                 'onchoose_mechanism': self.choose_mechanism,
@@ -1283,11 +1249,11 @@ class Auctioneer:
         self.experiment_id = str(uuid.uuid4())
 
         # Send a message to mark the beginning of the experiment
-        begin_exp_msg = mrta.msg.ExperimentEvent()
-        begin_exp_msg.experiment_id = self.experiment_id
-        begin_exp_msg.event = mrta.msg.ExperimentEvent.BEGIN_EXPERIMENT
-        stamp(begin_exp_msg)
-        self.experiment_pub.publish(begin_exp_msg)
+        # begin_exp_msg = mrta.msg.ExperimentEvent()
+        # begin_exp_msg.experiment_id = self.experiment_id
+        # begin_exp_msg.event = mrta.msg.ExperimentEvent.BEGIN_EXPERIMENT
+        # stamp(begin_exp_msg)
+        # self.experiment_pub.publish(begin_exp_msg)
 
         # Start the state machine
         self.fsm.startup()
@@ -1297,48 +1263,51 @@ class Auctioneer:
 
         # Listen for bids on '/tasks/bid'
         self.bid_sub = rospy.Subscriber('/tasks/bid',
-                                        mrta.msg.TaskBid,
+                                        mrplan_msgs.msg.ItemBid,
                                         self.on_bid_received)
 
-        self.status_sub = rospy.Subscriber('/tasks/status',
-                                           mrta.msg.TaskStatus,
-                                           self.on_task_status)
-
-        self.new_sub = rospy.Subscriber('/tasks/new',
-                                        mrta.msg.SensorSweepTask,
-                                        self.on_new_task)
+        # self.status_sub = rospy.Subscriber('/tasks/status',
+        #                                    mrta.msg.TaskStatus,
+        #                                    self.on_task_status)
+        #
+        # self.new_sub = rospy.Subscriber('/tasks/new',
+        #                                 mrta.msg.SensorSweepTask,
+        #                                 self.on_new_task)
 
         # Note: we also subscribe to team member positions in
         # identify_team(). We'd do it here, but can't until the
         # team has been identified.
 
         # For good measure...
-        time.sleep(3)
+        time.sleep(1)
 
     def init_publishers(self):
+        rospy.loginfo('Initializing publishers...')
 
         # Announce experiment events on '/experiment'.
         # Importantly, 'BEGIN_ALLOCATION', 'END_ALLOCATION', and
         # 'BEGIN_EXECUTION'.
-        self.experiment_pub = rospy.Publisher('/experiment',
-                                              mrta.msg.ExperimentEvent,
-                                              queue_size=3)
+        # self.experiment_pub = rospy.Publisher('/experiment',
+        #                                       mrta.msg.ExperimentEvent,
+        #                                       queue_size=3)
 
         # Announce tasks on '/tasks/announce'. For the moment we will only
         # announce sensor sweep tasks.
         self.announce_pub = rospy.Publisher('/tasks/announce',
-                                            mrta.msg.AnnounceSensorSweep,
+                                            mrplan_msgs.msg.Item,
+                                            latch=True,
                                             queue_size=3)
 
         # Award tasks on '/tasks/award'
         self.award_pub = rospy.Publisher('/tasks/award',
-                                         mrta.msg.TaskAward,
+                                         mrplan_msgs.msg.ItemAward,
+                                         latch=True,
                                          queue_size=10)
 
-        # '/debug'
-        self.debug_pub = rospy.Publisher('/debug',
-                                         mrta.msg.Debug,
-                                         queue_size=3)
+        # # '/debug'
+        # self.debug_pub = rospy.Publisher('/debug',
+        #                                  mrta.msg.Debug,
+        #                                  queue_size=3)
 
         # Markers for tasks
         self.marker_pub = rospy.Publisher('visualization_marker',
@@ -1346,7 +1315,7 @@ class Auctioneer:
                                           queue_size=3)
 
         # For good measure...
-        time.sleep(5)
+        time.sleep(1)
 
     def on_new_task(self, new_task_msg):
         rospy.loginfo("Received new task: {0}".format(pp.pformat(new_task_msg)))
@@ -1354,8 +1323,8 @@ class Auctioneer:
         new_task = mrta.SensorSweepTask(str(new_task_msg.task.task_id),
                                         float(new_task_msg.location.x),
                                         float(new_task_msg.location.y))
-        self.tasks.append(new_task)
-        self.tasks_by_id[new_task_msg.task.task_id] = new_task
+        self.items.append(new_task)
+        self.items_by_id[new_task_msg.task.task_id] = new_task
 
     def publish_task_marker(self, task, color=[0.5, 0.5, 0.5]):
         marker_msg = visualization_msgs.msg.Marker()
@@ -1446,121 +1415,77 @@ class Auctioneer:
 
         self.marker_pub.publish(marker_text_msg)
 
-    def add_scripted_task(self, task_id):
-        rospy.loginfo("'Adding' scripted task {0}...".format(task_id))
+    def add_scripted_item(self, item_id):
+        rospy.loginfo("'Adding' scripted task {0}...".format(item_id))
 
-        scripted_task = self.scripted_tasks_by_id[task_id]
-        self.tasks.append(scripted_task)
-        self.tasks_by_id[scripted_task.task_id] = scripted_task
+        scripted_item = self.scripted_items_by_id[item_id]
+        rospy.loginfo("Adding item: {0}".format(pp.pformat(scripted_item)))
+        self.items.append(scripted_item)
+        self.items_by_id[scripted_item.item_id] = scripted_item
 
-        self.new_task_added = True
-        rospy.loginfo("self.new_task_added=={0}".format(self.new_task_added))
+        self.new_item_added = True
+        rospy.loginfo("self.new_item_added=={0}".format(self.new_item_added))
 
-        rospy.loginfo("Publishing marker for {0}".format(scripted_task.task_id))
-        self.publish_task_marker(scripted_task)
+        # rospy.loginfo("Publishing marker for {0}".format(scripted_item.task_id))
+        # self.publish_task_marker(scripted_item)
 
-        rospy.loginfo("add_scripted_task(): current state=={0}".format(self.fsm.current))
+        rospy.loginfo("add_scripted_item(): current state=={0}".format(self.fsm.current))
 
-    def load_tasks(self, data):
-        # self.load_tasks_from_file()
-        self.load_tasks_from_db()
+    def load_scenario(self, data):
+        self.load_scenario_from_file()
+        # self.load_scenario_from_db()
 
-        rospy.loginfo("Scripted Tasks:\n{0}".format(pp.pformat(self.scripted_tasks_by_id)))
+        rospy.loginfo("Scripted Items:\n{0}".format(pp.pformat(self.scripted_items_by_id)))
 
         # Start timers
-        for task_timer in self.task_timers:
-            task_timer.start()
+        for item_timer in self.item_timers:
+            item_timer.start()
             # Sleep a tiny bit to make sure they're loaded
             time.sleep(0.1)
 
-        self.fsm.tasks_loaded()
+        self.fsm.scenario_loaded()
 
-    def load_tasks_from_db(self):
-        rospy.loginfo("Loading tasks from {0}...".format(TASKS_DB_FILENAME))
+    def load_scenario_from_db(self):
+        pass
 
-        if not self.scenario_id:
-            # rospy.logerror("No scenario_id given!")
+    def load_scenario_from_file(self):
+        rospy.loginfo("Loading tasks from {0}...".format(self.scenario_file))
+
+        if not self.scenario_file:
+            rospy.logerror("No scenario file given!")
             return
 
         try:
-            task_db = mrta.file_db.FileDB(TASKS_DB_FILENAME)
+            # pkg = rospkg.RosPack()
+            # pkg_path = pkg.get_path('mrplan_auctioneer')
+            #
+            # scenario_file = open(os.path.join(pkg_path, 'scenarios', self.scenario_file), 'rb')
 
-            loaded_tasks = task_db[self.scenario_id]
+            scenario_file = open(self.scenario_file, 'rb')
 
-            rospy.loginfo("{0}: {1}".format(self.scenario_id, pp.pformat(loaded_tasks)))
+            yaml_items = yaml.load(scenario_file)
 
-            for loaded_task in loaded_tasks:
+            for yaml_item in yaml_items:
+                new_item = Item(str(yaml_item['item_id']),
+                                [int(yaml_item['grey_count']),
+                                 int(yaml_item['red_count']),
+                                 int(yaml_item['blue_count']),
+                                 int(yaml_item['green_count']),
+                                 int(yaml_item['white_count']),
+                                 int(yaml_item['black_count'])],
+                                str(yaml_item['site']))
 
-                rospy.loginfo("auctioneer: task '{0}' depends on {1}".format(loaded_task.task_id, loaded_task.depends))
-
-                self.scripted_tasks.append(loaded_task)
-                self.scripted_tasks_by_id[loaded_task.task_id] = loaded_task
-
-                # Some stord instances of SensorSweep task might not have had the
-                # arrival_time attribute defined
-                try:
-                    loaded_task.arrival_time
-                except AttributeError:
-                    loaded_task.arrival_time = 0.0
-
-                self.task_timers.append(Timer(loaded_task.arrival_time,
-                                              self.add_scripted_task,
-                                              [loaded_task.task_id]))
-
-            # Necessary to log this?
-            debug_msg = mrta.msg.Debug()
-            debug_msg.key = 'auctioneer-scenario-id'
-            debug_msg.value = self.scenario_id
-            self.debug_pub.publish(debug_msg)
-
-        except Exception as e:
-            rospy.logerr("Can't open/parse scenario {0}!".format(self.scenario_id))
-            e_type, e_value, e_traceback = sys.exc_info()
-            rospy.logerr("{0}: {1}".format(e_type, e_value))
-            # rospy.logerr("{0}".format(e_traceback.format_exc()))
-
-    def load_tasks_from_file(self):
-        rospy.loginfo("Loading tasks from {0}...".format(self.task_file))
-
-        if not self.task_file:
-            rospy.logerror("No task file given!")
-            return
-
-        try:
-            task_file = open(self.task_file, 'rb')
-
-            yaml_tasks = yaml.load(task_file)
-
-            for yaml_task in yaml_tasks:
-
-                # task_id is string-ified here because an id may one day be
-                # an MD5 hash or some other non-integer value. They just happen
-                # to be integers here.
-                new_task = mrta.SensorSweepTask(str(yaml_task['task_id']),
-                                                float(yaml_task['location']['x']),
-                                                float(yaml_task['location']['y']),
-                                                0.0,  # z
-                                                int(yaml_task['num_robots']),
-                                                float(yaml_task['duration']),
-                                                yaml_task['depends'])
-
-                rospy.loginfo("auctioneer: task '{0}' depends on {1}".format(new_task.task_id, new_task.depends))
-
-                self.scripted_tasks.append(new_task)
-                self.scripted_tasks_by_id[str(yaml_task['task_id'])] = new_task
+                self.scripted_items.append(new_item)
+                self.scripted_items_by_id[str(yaml_item['item_id'])] = new_item
                 
-                self.task_timers.append(Timer(float(yaml_task['arrival_time']),
-                                              self.add_scripted_task,
-                                              [str(yaml_task['task_id'])]))
+                self.item_timers.append(Timer(float(yaml_item['arrival_time']),
+                                              self.add_scripted_item,
+                                              [str(yaml_item['item_id'])]))
 
-            # Necessary to log this?
-            debug_msg = mrta.msg.Debug()
-            debug_msg.key = 'auctioneer-task-file'
-            debug_msg.value = self.task_file
-            self.debug_pub.publish(debug_msg)
+                rospy.loginfo("Added item {0} and started its timer".format(new_item.item_id))
 
         except Exception as e:
-            rospy.logerr("Can't open/parse task file {0}!".format(self.task_file))
+            rospy.logerr("Can't open/parse scenario file {0}!".format(self.scenario_file))
             e_type, e_value, e_traceback = sys.exc_info()
             rospy.logerr("{0}: {1}".format(e_type, e_value))
             # rospy.logerr("{0}".format(e_traceback.format_exc()))
@@ -1626,28 +1551,32 @@ class Auctioneer:
     def idle(self, data):
         rospy.loginfo("state: idle")
 
-        # If our task pool (self.tasks) is empty, let's assume we were
+        # If our item pool (self.items) is empty, let's assume we were
         # started up with no predefined mission (i.e., no task_file startup
         # parameter). Idle here until some task appears, presumably via a
         # messages on the /tasks/new topic.
-        while not self.tasks:
+        while not self.items:
             self.rate.sleep()
+
+        rospy.loginfo("self.items=={0}".format(pp.pformat(self.items)))
 
         # There are scripted (dynamic) tasks yet to come. Idle until they arrive.
-        incomplete_scripted_tasks = True
-        while incomplete_scripted_tasks:
+        incomplete_scripted_items = True
+        while incomplete_scripted_items:
 
-            self.rate.sleep()
+            # self.rate.sleep()
+            time.sleep(0.1)
 
-            incomplete_scripted_tasks = False
-            for scripted_task in self.scripted_tasks:
-                if not scripted_task.completed:
-                    incomplete_scripted_tasks = True
+            incomplete_scripted_items = False
+
+            for scripted_item in self.scripted_items:
+                if not scripted_item.completed:
+                    incomplete_scripted_items = True
                     break
 
             unallocated = False
-            for task in self.tasks:
-                if not task.awarded:
+            for item in self.items:
+                if not item.awarded:
                     unallocated = True
                     break
 
@@ -1656,10 +1585,10 @@ class Auctioneer:
 
         if unallocated:
             # Transition to the "choose_mechanism" state
-            rospy.loginfo("Have unallocated tasks. Allocating...")
-            self.fsm.have_tasks()
+            self.fsm.have_items()
         else:
-            self.fsm.all_scripted_tasks_complete()
+            rospy.loginfo("All scripted items complete...")
+            self.fsm.all_scripted_items_complete()
 
     def p_medians_greedy(self, matrix, p):
         pass
@@ -1792,8 +1721,8 @@ class Auctioneer:
             target_id = pair[1]
 
             # The actual Task objects of the source and target
-            source = self.tasks_by_id[source_id]
-            target = self.tasks_by_id[target_id]
+            source = self.items_by_id[source_id]
+            target = self.items_by_id[target_id]
 
             # A mrta.Point instance
             source_point = source.location
@@ -1841,7 +1770,7 @@ class Auctioneer:
         median_vertex_ids = pmed_greedy(dist_matrix, p)
 
         median_task_ids = [task_graph.vs[v_id]['name'] for v_id in median_vertex_ids]
-        median_tasks = [self.tasks_by_id[t_id] for t_id in median_task_ids]
+        median_tasks = [self.items_by_id[t_id] for t_id in median_task_ids]
 
         debug_msg = mrta.msg.Debug()
         debug_msg.key = 'auctioneer-median-ids'
@@ -2019,42 +1948,49 @@ class Auctioneer:
 
         time.sleep(0.2)
 
-        # Send a message to mark the beginning of the allocation phase of
-        # the experiment
-        begin_alloc_msg = mrta.msg.ExperimentEvent()
-        begin_alloc_msg.experiment_id = self.experiment_id
-        begin_alloc_msg.event = mrta.msg.ExperimentEvent.BEGIN_ALLOCATION
-        stamp(begin_alloc_msg)
-        self.experiment_pub.publish(begin_alloc_msg)
+        # # Send a message to mark the beginning of the allocation phase of
+        # # the experiment
+        # begin_alloc_msg = mrta.msg.ExperimentEvent()
+        # begin_alloc_msg.experiment_id = self.experiment_id
+        # begin_alloc_msg.event = mrta.msg.ExperimentEvent.BEGIN_ALLOCATION
+        # stamp(begin_alloc_msg)
+        # self.experiment_pub.publish(begin_alloc_msg)
+
+        rospy.loginfo("state: choose_mechanism 2")
 
         # If we are doing task REallocation, pause here until we receive an
         # AGENDA_CLEARED TaskStatus message from each member of the team before
         # moving on to allocation.
         if self.reallocate:
+            rospy.loginfo("self.reallocation==True")
+
             while not self.team_agenda_cleared():
-                self.rate.sleep()
+                # self.rate.sleep()
+                time.sleep(0.1)
 
             # It's now safe to continue, but first reset 'AGENDA_CLEARED' flag for
             # all team members
             for team_member in self.team_members:
                 self.agenda_cleared[team_member] = False
 
+        rospy.loginfo("state: choose_mechanism 3")
+
         # For now, use the single mechanism given to us as a parameter
         rospy.loginfo("  {0}".format(self.mechanism))
 
-        # If we are REallocating, for each incomplete task t, set t.awarded = False
+        # If we are REallocating, for each incomplete item i, set i.awarded = False
         if self.reallocate:
-            for t in self.tasks:
-                if not t.completed:
-                    t.awarded = False
+            for i in self.items:
+                if not i.completed:
+                    i.awarded = False
 
         # As long as there are unallocated tasks, choose a mechanism and
         # allocate them. An unallocated task should be both incomplete and unawarded.
         while True:
             unallocated = []
-            for task in self.tasks:
-                if not task.awarded:
-                    unallocated.append(task)
+            for item in self.items:
+                if not item.awarded:
+                    unallocated.append(item)
 
             if not unallocated:
                 break
@@ -2062,13 +1998,13 @@ class Auctioneer:
             self.auction_round += 1
             self.bids[self.auction_round] = defaultdict(str)
 
-            # Send a message to mark the beginning of the mechanism-choosing phase of
-            # the experiment
-            begin_choose_msg = mrta.msg.ExperimentEvent()
-            begin_choose_msg.experiment_id = self.experiment_id
-            begin_choose_msg.event = mrta.msg.ExperimentEvent.BEGIN_SELECT_MECHANISM
-            stamp(begin_choose_msg)
-            self.experiment_pub.publish(begin_choose_msg)
+            # # Send a message to mark the beginning of the mechanism-choosing phase of
+            # # the experiment
+            # begin_choose_msg = mrta.msg.ExperimentEvent()
+            # begin_choose_msg.experiment_id = self.experiment_id
+            # begin_choose_msg.event = mrta.msg.ExperimentEvent.BEGIN_SELECT_MECHANISM
+            # stamp(begin_choose_msg)
+            # self.experiment_pub.publish(begin_choose_msg)
 
             # Use one particular mechanism by default, defined in a startup parameter
             mechanism = self.mechanism
@@ -2097,13 +2033,13 @@ class Auctioneer:
                 self.select_mechanism_dynamic(unallocated, mechanism)
                 rospy.loginfo("Auctioneer: Mechanism {0} selected dynamically".format(mechanism))
 
-            # Send a message to mark the end of the mechanism-choosing phase of
-            # the experiment
-            end_choose_msg = mrta.msg.ExperimentEvent()
-            end_choose_msg.experiment_id = self.experiment_id
-            end_choose_msg.event = mrta.msg.ExperimentEvent.END_SELECT_MECHANISM
-            stamp(end_choose_msg)
-            self.experiment_pub.publish(end_choose_msg)
+            # # Send a message to mark the end of the mechanism-choosing phase of
+            # # the experiment
+            # end_choose_msg = mrta.msg.ExperimentEvent()
+            # end_choose_msg.experiment_id = self.experiment_id
+            # end_choose_msg.event = mrta.msg.ExperimentEvent.END_SELECT_MECHANISM
+            # stamp(end_choose_msg)
+            # self.experiment_pub.publish(end_choose_msg)
 
             if mechanism == 'OSI':
                 auction_osi = AuctionOSI(self, unallocated, self.auction_round)
@@ -2125,22 +2061,19 @@ class Auctioneer:
             rospy.logdebug("######## choose_mechanism(): setting self.mechanism to {0} ########".format(mechanism))
             self.mechanism = mechanism
 
-        # Reset the allocation created by the PPSI auction that was run in select_mechanism_dynamic
-        self.ppsi_task_winners = None
-
         # An auction runs when it is instantiated (above).
         # At this point, we can (safely?) consider all previously unallocated
         # tasks to have been allocated
-        self.new_task_added = False
-        rospy.loginfo("self.new_task_added == {0}".format(self.new_task_added))
+        self.new_item_added = False
+        rospy.loginfo("self.new_item_added == {0}".format(self.new_item_added))
 
-        # We are finished allocating tasks. Signal the end of the allocation
-        # phase and the beginning of the execution phase.
-        end_alloc_msg = mrta.msg.ExperimentEvent()
-        end_alloc_msg.experiment_id = self.experiment_id
-        end_alloc_msg.event = mrta.msg.ExperimentEvent.END_ALLOCATION
-        stamp(end_alloc_msg)
-        self.experiment_pub.publish(end_alloc_msg)
+        # # We are finished allocating tasks. Signal the end of the allocation
+        # # phase and the beginning of the execution phase.
+        # end_alloc_msg = mrta.msg.ExperimentEvent()
+        # end_alloc_msg.experiment_id = self.experiment_id
+        # end_alloc_msg.event = mrta.msg.ExperimentEvent.END_ALLOCATION
+        # stamp(end_alloc_msg)
+        # self.experiment_pub.publish(end_alloc_msg)
 
         begin_exec_msg = mrta.msg.ExperimentEvent()
         begin_exec_msg.experiment_id = self.experiment_id
@@ -2186,7 +2119,7 @@ class Auctioneer:
         elif status == mrta.msg.TaskStatus.SUCCESS:
             rospy.loginfo("{0} has completed task {1}".format(robot_id, task_id))
 
-            completed_task = self.tasks_by_id[task_id]
+            completed_task = self.items_by_id[task_id]
             completed_task.completed = True
 
             # Remove/republish task marker to indicate completion (colored white?).
@@ -2203,11 +2136,11 @@ class Auctioneer:
 
         # Wait until all of the tasks (that have been allocated so far) are complete
         incomplete = True
-        while incomplete and not self.new_task_added:
+        while incomplete and not self.new_item_added:
 
             incomplete = False
-            for task in self.tasks:
-                if not task.completed:
+            for item in self.items:
+                if not item.completed:
                     incomplete = True
                     break
 
@@ -2216,7 +2149,7 @@ class Auctioneer:
 
         rospy.loginfo("Stopping task execution.")
         rospy.loginfo("incomplete=={0}".format(incomplete))
-        rospy.loginfo("self.new_task_added=={0}".format(self.new_task_added))
+        rospy.loginfo("self.new_task_added=={0}".format(self.new_item_added))
 
         # Either:
         # 1. All tasks (that have been allocated so far) have been completed.
@@ -2236,17 +2169,17 @@ class Auctioneer:
         self.experiment_pub.publish(end_exec_msg)
 
         incomplete_scripted_tasks = False
-        for scripted_task in self.scripted_tasks:
+        for scripted_task in self.scripted_items:
             if not scripted_task.completed:
                 incomplete_scripted_tasks = True
                 break
         
         if incomplete_scripted_tasks:
             rospy.loginfo("end_execution: there are incomplete scripted tasks")
-            self.fsm.have_tasks()
+            self.fsm.have_items()
         else:
             rospy.loginfo("end_execution: all scripted tasks are complete")
-            self.fsm.all_scripted_tasks_complete()
+            self.fsm.all_scripted_items_complete()
 
     def end_experiment(self, e):
         rospy.loginfo("state: end_experiment")
@@ -2263,6 +2196,7 @@ class Auctioneer:
         # Instead of exiting, wait to be shut down from outside
         while not rospy.is_shutdown():
             self.rate.sleep()
+
 
 if __name__ == '__main__':
     # Exit on ctrl-C

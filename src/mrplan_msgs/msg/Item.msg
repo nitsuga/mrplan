@@ -1,6 +1,8 @@
 #### Item.msg
 # An item is constructed from a number of materials
 
+std_msgs/Header header
+
 string item_id       # Unique item identifier
 
 uint8 GREY            = 0 # A colourless, generic material with no special properties

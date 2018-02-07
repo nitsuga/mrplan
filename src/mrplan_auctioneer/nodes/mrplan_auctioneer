@@ -2,7 +2,8 @@
 
 import rospy
 import sys
-import mrplan.auctioneer.Auctioneer
+
+from mrplan_auctioneer.auctioneer import Auctioneer
 
 
 if __name__ == '__main__':
